@@ -1,38 +1,61 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useNavigate } from "react-router";
-import { Upload, ImagePlus, X, Sparkles, ArrowRight, Images, Trash2, Clock, FolderOpen } from "lucide-react";
+import { Upload, ImagePlus, X, Sparkles, ArrowRight, Images, Trash2, Clock, FolderOpen, HardDrive } from "lucide-react";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
-import { saveAlbum, generateId, getAllAlbums, deleteAlbum, type Photo, type Album } from "../lib/storage";
+import {
+  saveAlbum, generateId, getAllAlbumSummaries, deleteAlbum,
+  migrateFromLocalStorage, getStorageEstimate, type AlbumSummary,
+} from "../lib/storage";
 import { compressImage } from "../lib/imageUtils";
 import { toast } from "sonner";
 import { motion, AnimatePresence } from "motion/react";
+
+interface PendingPhoto {
+  id: string;
+  blob: Blob;
+  previewUrl: string;
+  name: string;
+}
 
 export function Home() {
   const navigate = useNavigate();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [albumTitle, setAlbumTitle] = useState("");
-  const [photos, setPhotos] = useState<Photo[]>([]);
+  const [photos, setPhotos] = useState<PendingPhoto[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
   const [uploading, setUploading] = useState(false);
-  const [existingAlbums, setExistingAlbums] = useState<Album[]>([]);
+  const [existingAlbums, setExistingAlbums] = useState<AlbumSummary[]>([]);
+  const [storageInfo, setStorageInfo] = useState<string>("");
 
   useEffect(() => {
-    setExistingAlbums(getAllAlbums());
+    const init = async () => {
+      await migrateFromLocalStorage();
+      setExistingAlbums(await getAllAlbumSummaries());
+      const est = await getStorageEstimate();
+      if (est) setStorageInfo(`${est.usedMB} MB used of ${est.quotaMB} MB`);
+    };
+    init();
   }, []);
+
+  // Cleanup preview URLs on unmount
+  useEffect(() => {
+    return () => { photos.forEach(p => URL.revokeObjectURL(p.previewUrl)); };
+  }, [photos]);
 
   const processFiles = useCallback(async (files: FileList | File[]) => {
     const fileArray = Array.from(files).filter((f) => f.type.startsWith("image/"));
     if (fileArray.length === 0) return;
 
     setUploading(true);
-    const results: Photo[] = [];
+    const results: PendingPhoto[] = [];
 
     for (const file of fileArray) {
       try {
-        const dataUrl = await compressImage(file);
-        results.push({ id: generateId(), dataUrl, name: file.name });
+        const blob = await compressImage(file);
+        const previewUrl = URL.createObjectURL(blob);
+        results.push({ id: generateId(), blob, previewUrl, name: file.name });
       } catch {
         toast.error(`Could not process ${file.name}`);
       }
@@ -44,7 +67,6 @@ export function Home() {
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) processFiles(e.target.files);
-    // Reset so same files can be re-selected
     e.target.value = "";
   };
 
@@ -56,30 +78,39 @@ export function Home() {
     processFiles(e.dataTransfer.files);
   };
 
-  const removePhoto = (id: string) => setPhotos((prev) => prev.filter((p) => p.id !== id));
+  const removePhoto = (id: string) => {
+    setPhotos((prev) => {
+      const removed = prev.find(p => p.id === id);
+      if (removed) URL.revokeObjectURL(removed.previewUrl);
+      return prev.filter((p) => p.id !== id);
+    });
+  };
 
-  const handleCreate = () => {
+  const handleCreate = async () => {
     if (!albumTitle.trim()) { toast.error("Please enter an album title"); return; }
     if (photos.length === 0) { toast.error("Please upload at least one photo"); return; }
     if (uploading) { toast.error("Please wait for photos to finish uploading"); return; }
 
     setIsCreating(true);
-    const album = { id: generateId(), title: albumTitle.trim(), createdAt: Date.now(), photos };
+    const albumId = generateId();
 
     try {
-      saveAlbum(album);
-      setExistingAlbums(getAllAlbums());
-      setTimeout(() => navigate(`/album/${album.id}/results`), 300);
-    } catch {
-      toast.error("Storage full — try removing some photos or use fewer images.");
+      await saveAlbum(
+        { id: albumId, title: albumTitle.trim(), createdAt: Date.now() },
+        photos.map(p => ({ id: p.id, blob: p.blob, name: p.name }))
+      );
+      setTimeout(() => navigate(`/album/${albumId}/results`), 300);
+    } catch (err) {
+      console.error("Save failed:", err);
+      toast.error("Failed to save album. Please try again.");
       setIsCreating(false);
     }
   };
 
-  const handleDeleteAlbum = (albumId: string, albumTitle: string) => {
-    if (!window.confirm(`Delete "${albumTitle}" and all its reviews? This cannot be undone.`)) return;
-    deleteAlbum(albumId);
-    setExistingAlbums(getAllAlbums());
+  const handleDeleteAlbum = async (albumId: string, title: string) => {
+    if (!window.confirm(`Delete "${title}" and all its reviews? This cannot be undone.`)) return;
+    await deleteAlbum(albumId);
+    setExistingAlbums(await getAllAlbumSummaries());
     toast.success("Album deleted");
   };
 
@@ -208,8 +239,7 @@ export function Home() {
                         transition={{ delay: i * 0.03 }}
                         className="relative aspect-square rounded-xl overflow-hidden bg-gray-100"
                       >
-                        <img src={photo.dataUrl} alt={photo.name} className="w-full h-full object-cover" />
-                        {/* Always visible remove — important for touch */}
+                        <img src={photo.previewUrl} alt={photo.name} className="w-full h-full object-cover" />
                         <button
                           className="absolute top-1.5 right-1.5 w-6 h-6 bg-black/65 rounded-full flex items-center justify-center active:bg-black/90 transition-colors"
                           onClick={(e) => { e.stopPropagation(); removePhoto(photo.id); }}
@@ -243,9 +273,12 @@ export function Home() {
                 </>
               )}
             </Button>
-            <p className="text-center text-xs text-[#717182] mt-3 leading-relaxed">
-              Photos stored in your browser. Share the link so friends can vote & suggest.
-            </p>
+            {storageInfo && (
+              <p className="text-center text-xs text-[#717182] mt-3 leading-relaxed flex items-center justify-center gap-1">
+                <HardDrive className="w-3 h-3" />
+                {storageInfo}
+              </p>
+            )}
           </div>
         </motion.div>
 
@@ -270,18 +303,11 @@ export function Home() {
                     key={album.id}
                     className="flex items-center gap-3 px-4 sm:px-6 py-3 hover:bg-gray-50/50 transition-colors"
                   >
-                    {/* Thumbnail */}
                     <div className="w-11 h-11 rounded-xl overflow-hidden bg-gray-100 shrink-0">
-                      {album.photos[0] && (
-                        <img
-                          src={album.photos[0].dataUrl}
-                          alt=""
-                          className="w-full h-full object-cover"
-                        />
+                      {album.thumbnailUrl && (
+                        <img src={album.thumbnailUrl} alt="" className="w-full h-full object-cover" />
                       )}
                     </div>
-
-                    {/* Info — clickable */}
                     <button
                       className="flex-1 min-w-0 text-left active:opacity-70 transition-opacity"
                       onClick={() => navigate(`/album/${album.id}/results`)}
@@ -291,11 +317,9 @@ export function Home() {
                       </p>
                       <p className="text-[#717182] text-xs flex items-center gap-1 mt-0.5">
                         <Clock className="w-3 h-3" />
-                        {formatDate(album.createdAt)} · {album.photos.length} photo{album.photos.length !== 1 ? "s" : ""}
+                        {formatDate(album.createdAt)} · {album.photoCount} photo{album.photoCount !== 1 ? "s" : ""}
                       </p>
                     </button>
-
-                    {/* Delete */}
                     <button
                       className="w-8 h-8 flex items-center justify-center rounded-lg text-[#717182] hover:text-red-500 hover:bg-red-50 active:bg-red-100 transition-all shrink-0"
                       onClick={() => handleDeleteAlbum(album.id, album.title)}

@@ -1,9 +1,9 @@
 /**
- * Compresses an image file to a base64 data URL.
- * Resizes to max 1200×1200px and encodes as JPEG at 82% quality.
- * Keeps file sizes well under 300KB so localStorage doesn't overflow.
+ * Compresses an image file to a JPEG Blob.
+ * Resizes to max 1200×1200px and encodes at 75% quality.
+ * Returns a Blob (not a data URL) for efficient IndexedDB storage.
  */
-export function compressImage(file: File, maxDimension = 1200, quality = 0.82): Promise<string> {
+export function compressImage(file: File, maxDimension = 1200, quality = 0.75): Promise<Blob> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
 
@@ -32,7 +32,14 @@ export function compressImage(file: File, maxDimension = 1200, quality = 0.82): 
         if (!ctx) { reject(new Error("Canvas not supported")); return; }
 
         ctx.drawImage(img, 0, 0, width, height);
-        resolve(canvas.toDataURL("image/jpeg", quality));
+        canvas.toBlob(
+          (blob) => {
+            if (blob) resolve(blob);
+            else reject(new Error("Failed to compress image"));
+          },
+          "image/jpeg",
+          quality
+        );
       };
       img.src = e.target?.result as string;
     };

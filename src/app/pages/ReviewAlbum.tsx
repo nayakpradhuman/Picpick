@@ -1,26 +1,15 @@
 import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router";
 import {
-  Check,
-  MessageSquare,
-  Send,
-  Images,
-  ThumbsUp,
-  ChevronLeft,
-  ChevronRight,
-  X,
-  Maximize2,
-  Home,
+  Check, MessageSquare, Send, Images, ThumbsUp,
+  ChevronLeft, ChevronRight, X, Maximize2, Home,
 } from "lucide-react";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Textarea } from "../components/ui/textarea";
 import {
-  getAlbum,
-  saveReview,
-  generateId,
-  type Album,
-  type PhotoFeedback,
+  getAlbum, saveReview, generateId, revokePhotoUrls,
+  type Album, type PhotoFeedback,
 } from "../lib/storage";
 import { toast } from "sonner";
 import { motion, AnimatePresence } from "motion/react";
@@ -30,6 +19,7 @@ export function ReviewAlbum() {
   const navigate = useNavigate();
   const [album, setAlbum] = useState<Album | null>(null);
   const [notFound, setNotFound] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [reviewerName, setReviewerName] = useState("");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [feedback, setFeedback] = useState<Record<string, string>>({});
@@ -40,9 +30,20 @@ export function ReviewAlbum() {
 
   useEffect(() => {
     if (!id) return;
-    const found = getAlbum(id);
-    if (found) setAlbum(found);
-    else setNotFound(true);
+    let cancelled = false;
+    const load = async () => {
+      const found = await getAlbum(id);
+      if (cancelled) return;
+      if (found) setAlbum(found);
+      else setNotFound(true);
+      setLoading(false);
+    };
+    load();
+    return () => {
+      cancelled = true;
+      // Revoke object URLs on unmount
+      if (album) revokePhotoUrls(album.photos);
+    };
   }, [id]);
 
   const toggleSelect = (photoId: string) => {
@@ -51,20 +52,18 @@ export function ReviewAlbum() {
       next.has(photoId) ? next.delete(photoId) : next.add(photoId);
       return next;
     });
-    // Close any open suggestion box when tapping the photo
     setActiveComment(null);
   };
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (!reviewerName.trim()) { toast.error("Please enter your name first"); return; }
     if (selectedIds.size === 0) { toast.error("Please select at least one photo you like"); return; }
 
-    // Build feedback array — text field matches PhotoFeedback interface
     const photoFeedback: PhotoFeedback[] = Object.entries(feedback)
       .filter(([, text]) => text.trim())
       .map(([photoId, text]) => ({ photoId, text: text.trim() }));
 
-    saveReview({
+    await saveReview({
       id: generateId(),
       albumId: id!,
       reviewerName: reviewerName.trim(),
@@ -119,7 +118,7 @@ export function ReviewAlbum() {
   }
 
   /* ── Loading ────────────────────────────────────────────────── */
-  if (!album) {
+  if (loading || !album) {
     return (
       <div className="min-h-screen flex items-center justify-center">
         <div className="w-8 h-8 border-2 border-[#8b5cf6] border-t-transparent rounded-full animate-spin" />
@@ -160,9 +159,7 @@ export function ReviewAlbum() {
   /* ── Main review view ──────────────────────────────────────── */
   return (
     <>
-      {/* Extra bottom padding so sticky bar never overlaps content */}
       <div className="min-h-screen bg-gradient-to-br from-[#fdf0f8] via-white to-[#f0f0ff] pb-36">
-
         {/* Header */}
         <header className="border-b border-black/5 bg-white/80 backdrop-blur-sm sticky top-0 z-10">
           <div className="max-w-3xl mx-auto px-4 py-3.5 flex items-center gap-2.5">
@@ -219,7 +216,6 @@ export function ReviewAlbum() {
                   transition={{ delay: i * 0.04 }}
                   className="flex flex-col gap-1.5"
                 >
-                  {/* Photo card */}
                   <div
                     className={`relative aspect-square rounded-2xl overflow-hidden cursor-pointer transition-all duration-200 active:scale-[0.97] ${
                       isSelected
@@ -229,12 +225,10 @@ export function ReviewAlbum() {
                     onClick={() => toggleSelect(photo.id)}
                   >
                     <img
-                      src={photo.dataUrl}
+                      src={photo.url}
                       alt={photo.name}
                       className={`w-full h-full object-cover transition-transform duration-200 ${isSelected ? "scale-[1.03]" : ""}`}
                     />
-
-                    {/* Selection overlay */}
                     <AnimatePresence>
                       {isSelected && (
                         <motion.div
@@ -249,8 +243,6 @@ export function ReviewAlbum() {
                         </motion.div>
                       )}
                     </AnimatePresence>
-
-                    {/* Expand — always visible, top-left */}
                     <button
                       className="absolute top-2 left-2 w-7 h-7 bg-black/50 rounded-lg flex items-center justify-center active:bg-black/70 transition-colors"
                       onClick={(e) => { e.stopPropagation(); setLightboxPhoto(photo.id); }}
@@ -259,7 +251,6 @@ export function ReviewAlbum() {
                     </button>
                   </div>
 
-                  {/* Suggest button — always visible below photo */}
                   <button
                     className={`w-full flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl text-xs transition-all active:scale-95 ${
                       hasFeedback
@@ -272,7 +263,6 @@ export function ReviewAlbum() {
                     {hasFeedback ? "Edit suggestion" : "Add suggestion"}
                   </button>
 
-                  {/* Suggestion textarea — expands inline */}
                   <AnimatePresence>
                     {isCommentOpen && (
                       <motion.div
@@ -324,7 +314,7 @@ export function ReviewAlbum() {
         </main>
       </div>
 
-      {/* ── Sticky bottom submit bar ─────────────────────────── */}
+      {/* Sticky bottom submit bar */}
       <div
         className="fixed bottom-0 inset-x-0 z-20 bg-white/95 backdrop-blur-md border-t border-black/10 px-4 pt-3"
         style={{ paddingBottom: "max(12px, env(safe-area-inset-bottom, 12px))" }}
@@ -348,7 +338,7 @@ export function ReviewAlbum() {
         </div>
       </div>
 
-      {/* ── Lightbox ────────────────────────────────────────────── */}
+      {/* Lightbox */}
       <AnimatePresence>
         {lightboxPhoto && (
           <motion.div
@@ -360,15 +350,12 @@ export function ReviewAlbum() {
             onTouchStart={handleLightboxTouchStart}
             onTouchEnd={handleLightboxTouchEnd}
           >
-            {/* Close */}
             <button
               className="absolute top-4 right-4 w-10 h-10 bg-white/15 rounded-full flex items-center justify-center active:bg-white/30 z-10"
               onClick={(e) => { e.stopPropagation(); setLightboxPhoto(null); }}
             >
               <X className="w-5 h-5 text-white" />
             </button>
-
-            {/* Prev / Next */}
             {album.photos.length > 1 && (
               <>
                 <button
@@ -385,19 +372,17 @@ export function ReviewAlbum() {
                 </button>
               </>
             )}
-
             <motion.img
               key={lightboxPhoto}
               initial={{ scale: 0.92, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.92, opacity: 0 }}
               transition={{ duration: 0.18 }}
-              src={album.photos.find((p) => p.id === lightboxPhoto)?.dataUrl}
+              src={album.photos.find((p) => p.id === lightboxPhoto)?.url}
               className="max-w-full max-h-[80vh] object-contain rounded-xl"
               style={{ padding: "0 56px" }}
               onClick={(e) => e.stopPropagation()}
             />
-
             <div className="absolute bottom-6 inset-x-0 text-center">
               <span className="text-white/70 text-sm">
                 {lightboxIndex + 1} / {album.photos.length}
