@@ -1,14 +1,15 @@
 /**
- * Storage layer using IndexedDB for large photo storage.
- * localStorage has a ~5MB limit; IndexedDB supports hundreds of MB to GB.
- * Photos are stored as binary Blobs (no base64 overhead).
+ * Storage layer using Supabase (cloud database + file storage).
+ * Albums and reviews in PostgreSQL, photos in Supabase Storage.
+ * Works across devices — shareable links work for everyone.
  */
+import { supabase } from "./supabaseClient";
 
-// ── Types ──────────────────────────────────────────────────────
+// ── Public types (unchanged from before) ───────────────────────
 
 export interface Photo {
   id: string;
-  url: string; // object URL for display (created from stored blob)
+  url: string;
   name: string;
 }
 
@@ -41,118 +42,15 @@ export interface Review {
   submittedAt: number;
 }
 
-// ── Internal stored types ──────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────
 
-interface StoredAlbumMeta {
-  id: string;
-  title: string;
-  createdAt: number;
-  photoIds: string[];
-  thumbnailDataUrl: string; // tiny thumbnail for list view
+function getPublicUrl(path: string): string {
+  const { data } = supabase.storage.from("photos").getPublicUrl(path);
+  return data.publicUrl;
 }
 
-interface StoredPhoto {
-  id: string;
-  albumId: string;
-  blob: Blob;
-  name: string;
-}
-
-// ── IndexedDB setup ────────────────────────────────────────────
-
-const DB_NAME = "picpick_db";
-const DB_VERSION = 1;
-
-function openDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains("albums")) {
-        db.createObjectStore("albums", { keyPath: "id" });
-      }
-      if (!db.objectStoreNames.contains("photos")) {
-        const ps = db.createObjectStore("photos", { keyPath: "id" });
-        ps.createIndex("albumId", "albumId", { unique: false });
-      }
-      if (!db.objectStoreNames.contains("reviews")) {
-        const rs = db.createObjectStore("reviews", { keyPath: "id" });
-        rs.createIndex("albumId", "albumId", { unique: false });
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-function idbGet<T>(store: string, key: string): Promise<T | undefined> {
-  return openDB().then(db => new Promise((resolve, reject) => {
-    const tx = db.transaction(store, "readonly");
-    const req = tx.objectStore(store).get(key);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  }));
-}
-
-function idbGetAll<T>(store: string): Promise<T[]> {
-  return openDB().then(db => new Promise((resolve, reject) => {
-    const tx = db.transaction(store, "readonly");
-    const req = tx.objectStore(store).getAll();
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  }));
-}
-
-function idbGetByIndex<T>(store: string, indexName: string, key: string): Promise<T[]> {
-  return openDB().then(db => new Promise((resolve, reject) => {
-    const tx = db.transaction(store, "readonly");
-    const idx = tx.objectStore(store).index(indexName);
-    const req = idx.getAll(key);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  }));
-}
-
-function idbPut(store: string, value: unknown): Promise<void> {
-  return openDB().then(db => new Promise((resolve, reject) => {
-    const tx = db.transaction(store, "readwrite");
-    tx.objectStore(store).put(value);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  }));
-}
-
-function idbDelete(store: string, key: string): Promise<void> {
-  return openDB().then(db => new Promise((resolve, reject) => {
-    const tx = db.transaction(store, "readwrite");
-    tx.objectStore(store).delete(key);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  }));
-}
-
-// ── Thumbnail generator ────────────────────────────────────────
-
-async function generateThumbnail(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    const src = URL.createObjectURL(blob);
-    img.onload = () => {
-      const size = 120;
-      const canvas = document.createElement("canvas");
-      canvas.width = size;
-      canvas.height = size;
-      const ctx = canvas.getContext("2d")!;
-      const min = Math.min(img.width, img.height);
-      const sx = (img.width - min) / 2;
-      const sy = (img.height - min) / 2;
-      ctx.drawImage(img, sx, sy, min, min, 0, 0, size, size);
-      URL.revokeObjectURL(src);
-      resolve(canvas.toDataURL("image/jpeg", 0.5));
-    };
-    img.onerror = () => { URL.revokeObjectURL(src); reject(new Error("Thumbnail failed")); };
-    img.src = src;
-  });
+export function generateId(): string {
+  return Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
 }
 
 // ── Album CRUD ─────────────────────────────────────────────────
@@ -161,152 +59,161 @@ export async function saveAlbum(
   meta: { id: string; title: string; createdAt: number },
   photos: { id: string; blob: Blob; name: string }[]
 ): Promise<void> {
-  const thumbnail = photos.length > 0
-    ? await generateThumbnail(photos[0].blob)
-    : "";
+  // 1. Upload each photo to Supabase Storage
+  const photoRecords: { id: string; album_id: string; name: string; storage_path: string; position: number }[] = [];
+  let thumbnailUrl = "";
 
-  const albumMeta: StoredAlbumMeta = {
+  for (let i = 0; i < photos.length; i++) {
+    const p = photos[i];
+    const path = `${meta.id}/${p.id}.jpg`;
+
+    const { error } = await supabase.storage
+      .from("photos")
+      .upload(path, p.blob, { contentType: "image/jpeg", upsert: true });
+    if (error) throw error;
+
+    const url = getPublicUrl(path);
+    if (i === 0) thumbnailUrl = url;
+
+    photoRecords.push({
+      id: p.id,
+      album_id: meta.id,
+      name: p.name,
+      storage_path: path,
+      position: i,
+    });
+  }
+
+  // 2. Save album metadata
+  const { error: albumErr } = await supabase.from("albums").insert({
     id: meta.id,
     title: meta.title,
-    createdAt: meta.createdAt,
-    photoIds: photos.map(p => p.id),
-    thumbnailDataUrl: thumbnail,
-  };
+    created_at: meta.createdAt,
+    thumbnail_url: thumbnailUrl,
+  });
+  if (albumErr) throw albumErr;
 
-  await idbPut("albums", albumMeta);
-  for (const p of photos) {
-    const stored: StoredPhoto = { id: p.id, albumId: meta.id, blob: p.blob, name: p.name };
-    await idbPut("photos", stored);
+  // 3. Save photo records
+  if (photoRecords.length > 0) {
+    const { error: photoErr } = await supabase.from("photos").insert(photoRecords);
+    if (photoErr) throw photoErr;
   }
 }
 
 export async function getAlbum(id: string): Promise<Album | null> {
-  const meta = await idbGet<StoredAlbumMeta>("albums", id);
-  if (!meta) return null;
+  const { data: album } = await supabase
+    .from("albums")
+    .select("*")
+    .eq("id", id)
+    .single();
 
-  const storedPhotos = await idbGetByIndex<StoredPhoto>("photos", "albumId", id);
-  const photoMap = new Map(storedPhotos.map(p => [p.id, p]));
+  if (!album) return null;
 
-  const photos: Photo[] = meta.photoIds
-    .map(pid => photoMap.get(pid))
-    .filter((p): p is StoredPhoto => !!p)
-    .map(p => ({ id: p.id, url: URL.createObjectURL(p.blob), name: p.name }));
+  const { data: photosData } = await supabase
+    .from("photos")
+    .select("*")
+    .eq("album_id", id)
+    .order("position");
 
-  return { id: meta.id, title: meta.title, createdAt: meta.createdAt, photos };
+  const photos: Photo[] = (photosData || []).map((p) => ({
+    id: p.id,
+    url: getPublicUrl(p.storage_path),
+    name: p.name,
+  }));
+
+  return {
+    id: album.id,
+    title: album.title,
+    createdAt: album.created_at,
+    photos,
+  };
 }
 
 export async function getAllAlbumSummaries(): Promise<AlbumSummary[]> {
-  const metas = await idbGetAll<StoredAlbumMeta>("albums");
-  return metas.map(m => ({
-    id: m.id,
-    title: m.title,
-    createdAt: m.createdAt,
-    photoCount: m.photoIds.length,
-    thumbnailUrl: m.thumbnailDataUrl,
+  const { data } = await supabase
+    .from("albums")
+    .select("id, title, created_at, thumbnail_url")
+    .order("created_at", { ascending: false });
+
+  if (!data) return [];
+
+  // Get photo counts
+  const { data: counts } = await supabase
+    .from("photos")
+    .select("album_id");
+
+  const countMap = new Map<string, number>();
+  (counts || []).forEach((p) => {
+    countMap.set(p.album_id, (countMap.get(p.album_id) || 0) + 1);
+  });
+
+  return data.map((a) => ({
+    id: a.id,
+    title: a.title,
+    createdAt: a.created_at,
+    photoCount: countMap.get(a.id) || 0,
+    thumbnailUrl: a.thumbnail_url || "",
   }));
 }
 
 export async function deleteAlbum(id: string): Promise<void> {
-  const meta = await idbGet<StoredAlbumMeta>("albums", id);
-  if (meta) {
-    for (const pid of meta.photoIds) {
-      await idbDelete("photos", pid);
-    }
+  // Get photo paths for storage cleanup
+  const { data: photos } = await supabase
+    .from("photos")
+    .select("storage_path")
+    .eq("album_id", id);
+
+  // Delete from storage
+  if (photos && photos.length > 0) {
+    await supabase.storage
+      .from("photos")
+      .remove(photos.map((p) => p.storage_path));
   }
-  await idbDelete("albums", id);
-  await deleteReviewsForAlbum(id);
+
+  // Delete album (CASCADE deletes photos + reviews)
+  await supabase.from("albums").delete().eq("id", id);
 }
 
 // ── Review CRUD ────────────────────────────────────────────────
 
 export async function saveReview(review: Review): Promise<void> {
-  await idbPut("reviews", review);
+  const { error } = await supabase.from("reviews").insert({
+    id: review.id,
+    album_id: review.albumId,
+    reviewer_name: review.reviewerName,
+    selected_photo_ids: review.selectedPhotoIds,
+    feedback: review.feedback,
+    submitted_at: review.submittedAt,
+  });
+  if (error) throw error;
 }
 
 export async function getReviewsForAlbum(albumId: string): Promise<Review[]> {
-  return idbGetByIndex<Review>("reviews", "albumId", albumId);
+  const { data } = await supabase
+    .from("reviews")
+    .select("*")
+    .eq("album_id", albumId)
+    .order("submitted_at");
+
+  return (data || []).map((r) => ({
+    id: r.id,
+    albumId: r.album_id,
+    reviewerName: r.reviewer_name,
+    selectedPhotoIds: r.selected_photo_ids,
+    feedback: r.feedback as PhotoFeedback[],
+    submittedAt: r.submitted_at,
+  }));
 }
 
-async function deleteReviewsForAlbum(albumId: string): Promise<void> {
-  const reviews = await getReviewsForAlbum(albumId);
-  for (const r of reviews) {
-    await idbDelete("reviews", r.id);
-  }
-}
+// ── No-ops (kept for backward compatibility with page imports) ─
 
-// ── Helpers ────────────────────────────────────────────────────
+/** No-op — Supabase URLs don't need revoking */
+export function revokePhotoUrls(_photos: Photo[]): void {}
 
-export function generateId(): string {
-  return Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
-}
+/** No-op — migration not needed with Supabase */
+export async function migrateFromLocalStorage(): Promise<void> {}
 
-/** Revoke object URLs to free memory. Call on component unmount. */
-export function revokePhotoUrls(photos: Photo[]): void {
-  photos.forEach(p => {
-    try { URL.revokeObjectURL(p.url); } catch { /* ignore */ }
-  });
-}
-
-/** Storage estimate (if browser supports it) */
+/** No-op — Supabase handles storage */
 export async function getStorageEstimate(): Promise<{ usedMB: number; quotaMB: number } | null> {
-  if (navigator.storage?.estimate) {
-    const est = await navigator.storage.estimate();
-    return {
-      usedMB: Math.round((est.usage ?? 0) / 1024 / 1024),
-      quotaMB: Math.round((est.quota ?? 0) / 1024 / 1024),
-    };
-  }
   return null;
-}
-
-// ── Migration from localStorage ────────────────────────────────
-
-function dataUrlToBlob(dataUrl: string): Blob {
-  const parts = dataUrl.split(",");
-  const mime = parts[0].match(/:(.*?);/)?.[1] ?? "image/jpeg";
-  const b64 = atob(parts[1]);
-  const u8 = new Uint8Array(b64.length);
-  for (let i = 0; i < b64.length; i++) u8[i] = b64.charCodeAt(i);
-  return new Blob([u8], { type: mime });
-}
-
-interface LegacyPhoto { id: string; dataUrl: string; name: string; }
-interface LegacyAlbum { id: string; title: string; createdAt: number; photos: LegacyPhoto[]; }
-
-export async function migrateFromLocalStorage(): Promise<void> {
-  const ALBUMS_KEY = "picpick_albums";
-  const REVIEWS_KEY = "picpick_reviews";
-  const MIGRATED_KEY = "picpick_migrated_to_idb";
-
-  if (localStorage.getItem(MIGRATED_KEY)) return;
-
-  try {
-    const rawAlbums = localStorage.getItem(ALBUMS_KEY);
-    if (rawAlbums) {
-      const albums: LegacyAlbum[] = JSON.parse(rawAlbums);
-      for (const album of albums) {
-        const photos = album.photos.map(p => ({
-          id: p.id,
-          blob: dataUrlToBlob(p.dataUrl),
-          name: p.name,
-        }));
-        await saveAlbum(
-          { id: album.id, title: album.title, createdAt: album.createdAt },
-          photos
-        );
-      }
-    }
-
-    const rawReviews = localStorage.getItem(REVIEWS_KEY);
-    if (rawReviews) {
-      const reviews: Review[] = JSON.parse(rawReviews);
-      for (const r of reviews) await saveReview(r);
-    }
-
-    localStorage.setItem(MIGRATED_KEY, "1");
-    localStorage.removeItem(ALBUMS_KEY);
-    localStorage.removeItem(REVIEWS_KEY);
-  } catch (e) {
-    console.warn("Migration from localStorage failed:", e);
-  }
 }
